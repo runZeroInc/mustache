@@ -3,6 +3,7 @@ module github.com/runZeroInc/mustache/v2
 go 1.23
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/spf13/cobra v1.0.0
 	gopkg.in/yaml.v2 v2.3.0
 )

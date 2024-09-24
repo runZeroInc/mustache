@@ -7,6 +7,8 @@ import (
 	"path"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 type Test struct {
@@ -452,6 +454,8 @@ func TestRenderJSON(t *testing.T) {
 		Name  string
 	}
 
+	testUuid := uuid.New()
+
 	tests := []struct {
 		Template string
 		Data     map[string]any
@@ -504,6 +508,20 @@ func TestRenderJSON(t *testing.T) {
 				},
 			},
 			Result: `[4,5,6]`,
+		},
+		{
+			Template: `{{uuid}}`,
+			Data: map[string]any{
+				"uuid": testUuid,
+			},
+			Result: testUuid.String(),
+		},
+		{
+			Template: `{{byteAry}}`,
+			Data: map[string]any{
+				"byteAry": []byte("foobar🟡"),
+			},
+			Result: "foobar🟡",
 		},
 	}
 	for _, tst := range tests {

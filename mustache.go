@@ -781,14 +781,48 @@ func (tmpl *Template) renderElement(element any, contextChain []any, buf io.Writ
 				s := fmt.Sprint(val.Interface())
 				switch tmpl.outputMode {
 				case EscapeJSON:
+					// Whether to use JSON's marshalling (true) or our JSON escaping (false)
+					useMarshal := false
+
+					var kind reflect.Kind
+					typeof := reflect.TypeOf(val.Interface())
+					if typeof != nil {
+						kind = typeof.Kind()
+					}
+
 					// Output arrays and objects in JSON format, if in JSON mode
-					kind := reflect.TypeOf(val.Interface()).Kind()
 					if kind == reflect.Slice || kind == reflect.Array || kind == reflect.Map {
+						useMarshal = true
+					}
+
+					//
+					// Special case overrides
+					//
+					if typeof != nil {
+						switch typeof.String() {
+						case "uuid.UUID":
+							// JSON's implementation encloses UUID in double-quotes,
+							// so use ours instead
+							useMarshal = false
+						case "[]uint8":
+							// JSON's implementation encloses the base64 encoded value in double quotes,
+							// so use ours instead
+							if ba, ok := val.Interface().([]byte); ok {
+								s = string(ba[:])
+								useMarshal = false
+							}
+						}
+					}
+
+					if useMarshal {
 						marshalledJson, err := json.Marshal(val.Interface())
 						if err != nil {
 							return err
 						}
-						buf.Write(marshalledJson)
+						_, err = buf.Write(marshalledJson)
+						if err != nil {
+							return err
+						}
 						break
 					}
 					if err = JSONEscape(buf, s); err != nil {
