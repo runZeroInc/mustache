@@ -3,6 +3,7 @@ package mustache
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -40,6 +42,52 @@ type Compiler struct {
 	outputMode          EscapeMode
 	errorOnMissing      bool
 	customJSONMarshaler JSONMarshalFn
+
+	// runzero patch: render-time safety limits. A
+	// PartialProvider that returns a body which (directly or via a cycle)
+	// re-references a partial would otherwise recurse without bound and
+	// overflow the goroutine stack — a fatal, unrecoverable runtime error that
+	// no recover() can catch. These limits are shared across every template
+	// recompiled from this Compiler (children carry the same *Compiler via
+	// Template.parent), so the bound holds across partial expansion. They are
+	// reset at the start of each top-level render.
+	limits *renderLimits
+}
+
+// renderLimits carries the active per-render safety budget. A zero value
+// imposes the package defaults (see ensureRenderLimits).
+type renderLimits struct {
+	maxPartialDepth int   // max nested partial expansions
+	curPartialDepth int   // current nesting (mutated during render)
+	maxOutputBytes  int   // 0 == unlimited
+	writtenBytes    int   // bytes emitted so far (mutated during render)
+	deadline        int64 // unixnano render deadline, 0 == none
+}
+
+// DefaultMaxPartialDepth bounds nested partial expansion to defend against
+// cyclic / self-referential partials that would otherwise overflow the stack.
+const DefaultMaxPartialDepth = 64
+
+// errors returned when a render exceeds its safety budget.
+var (
+	ErrMaxPartialDepthExceeded = errors.New("mustache: maximum partial expansion depth exceeded")
+	ErrOutputSizeExceeded      = errors.New("mustache: rendered output exceeds maximum size")
+	ErrRenderDeadlineExceeded  = errors.New("mustache: render deadline exceeded")
+)
+
+// WithRenderLimits configures the maximum rendered output size (in bytes; 0 for
+// unlimited) and a render deadline as a duration from the start of the render (0
+// for none). The partial-expansion depth cap always applies (DefaultMaxPartialDepth).
+// runzero patch.
+func (r *Compiler) WithRenderLimits(maxOutputBytes int, deadline time.Duration) *Compiler {
+	r.limits = &renderLimits{
+		maxPartialDepth: DefaultMaxPartialDepth,
+		maxOutputBytes:  maxOutputBytes,
+	}
+	if deadline > 0 {
+		r.limits.deadline = time.Now().Add(deadline).UnixNano()
+	}
+	return r
 }
 
 // JSONMarshalFn is the signature of a function which can marshal a value to JSON and
@@ -852,6 +900,21 @@ func (tmpl *Template) renderElement(element any, contextChain []any, buf io.Writ
 			}
 			return nil
 		}
+		// runzero patch: bound partial-expansion depth.
+		// Partials are recompiled and rendered recursively; a provider that
+		// returns a body re-referencing a partial (e.g. a self-referential
+		// "{{> body }}") would otherwise recurse until the goroutine stack
+		// overflows — a fatal, unrecoverable crash. Returning an error well
+		// before that lets callers treat it as a render failure.
+		if lim := tmpl.renderLimits(); lim != nil {
+			if lim.curPartialDepth >= lim.maxPartialDepth {
+				return ErrMaxPartialDepthExceeded
+			}
+			lim.curPartialDepth++
+			err := partial.renderTemplate(contextChain, buf)
+			lim.curPartialDepth--
+			return err
+		}
 		if err := partial.renderTemplate(contextChain, buf); err != nil {
 			return err
 		}
@@ -877,12 +940,45 @@ func JSONMarshal(dest io.Writer, value any) error {
 }
 
 func (tmpl *Template) renderTemplate(contextChain []any, buf io.Writer) error {
+	// runzero patch: enforce the render deadline once per template
+	// invocation. This is cheap and gives a hard upper bound on total render
+	// time even for pathological (but non-recursive) expansion.
+	if lim := tmpl.renderLimits(); lim != nil && lim.deadline != 0 {
+		if time.Now().UnixNano() > lim.deadline {
+			return ErrRenderDeadlineExceeded
+		}
+	}
 	for _, elem := range tmpl.elems {
 		if err := tmpl.renderElement(elem, contextChain, buf); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// renderLimits returns the active render budget shared via the parent Compiler,
+// or nil if none is configured. runzero patch.
+func (tmpl *Template) renderLimits() *renderLimits {
+	if tmpl.parent == nil {
+		return nil
+	}
+	return tmpl.parent.limits
+}
+
+// limitWriter wraps the render output writer to enforce a maximum byte count.
+type limitWriter struct {
+	w   io.Writer
+	lim *renderLimits
+}
+
+func (lw limitWriter) Write(p []byte) (int, error) {
+	if lw.lim != nil && lw.lim.maxOutputBytes > 0 {
+		if lw.lim.writtenBytes+len(p) > lw.lim.maxOutputBytes {
+			return 0, ErrOutputSizeExceeded
+		}
+		lw.lim.writtenBytes += len(p)
+	}
+	return lw.w.Write(p)
 }
 
 // Frender uses the given data source - generally a map or struct - to
@@ -893,6 +989,24 @@ func (tmpl *Template) Frender(out io.Writer, context ...any) error {
 		val := reflect.ValueOf(c)
 		contextChain = append(contextChain, val)
 	}
+
+	// runzero patch: ensure a render budget is active and
+	// reset its per-render counters at the start of every top-level render.
+	// Even when no explicit limits were configured, we install a default
+	// partial-expansion depth cap so cyclic/self-referential partials cannot
+	// overflow the stack (an unrecoverable fatal error).
+	if tmpl.parent != nil {
+		if tmpl.parent.limits == nil {
+			tmpl.parent.limits = &renderLimits{maxPartialDepth: DefaultMaxPartialDepth}
+		} else if tmpl.parent.limits.maxPartialDepth <= 0 {
+			tmpl.parent.limits.maxPartialDepth = DefaultMaxPartialDepth
+		}
+		lim := tmpl.parent.limits
+		lim.curPartialDepth = 0
+		lim.writtenBytes = 0
+		out = limitWriter{w: out, lim: lim}
+	}
+
 	return tmpl.renderTemplate(contextChain, out)
 }
 
